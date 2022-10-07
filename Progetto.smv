@@ -1,0 +1,463 @@
+-- Progetto Linguaggi di Programmazione e Verifica del software
+-- A.A.: 2021-2022
+-- Studente: Alessio Muzi
+-- Matricola: 299329
+-- Modellazione del protocollo TruDaMul, composto da 1 client, 1 proxy, 1 server e 2 mule in un territorio.
+
+-- Il protocollo si appoggia ad un sistema di deposito dati off-chain DFS (Decentralized File Storage), implementato tramite IPFS (InterPlanetary File System).
+-- Il pagamento tra client, mule e proxy per i servizi erogati avviene tramite blockchain (Ethereum).
+-- Situazione iniziale: Il client si trova in una condizione offline (assenza di connesione a banda larga) e vuole comunicare con un server online.
+
+
+MODULE main
+
+VAR
+  -- Zona offline:
+  -- Modulo client, i suoi argomenti sono i mule con cui comunica.
+  c: client(m1, m2);
+
+  -- Mule:
+  -- Modulo mule, i suoi argomenti sono il DFS, il client ed il proxy dei quali è il tramite e la direzione in cui opera (1: client-server).
+  m1: mule(c, p, d, 1);
+  -- Modulo mule, i suoi argomenti sono il DFS, il client ed il proxy dei quali è il tramite e la direzione in cui opera (2: server-client).
+  m2: mule(c, p, d, 2);
+
+  -- Zona online:
+  -- Modulo DFS, ha la funzione di deposito asincrono dei dati e comunica con i mule ed il proxy.
+  d: dfs(m1, m2, p);
+  -- Modulo proxy, i suoi argomenti sono i mule, il server ed il DFS con cui comunica.
+  p: proxy(m1, m2, d, s);
+  -- Modulo server, il quale non conosce l'implementazione del protocollo e il suo unico argomento è il proxy con cui comunica.
+  s: server(p);
+
+
+-- Proprietà
+-- Misbehavior 1: m1 prende il payload ma non lo annuncia a p.
+--                Il mule viene incentivato ad eseguire correttamente il protocollo poichè riceverà il pagamento solo se consegna il payload.
+CTLSPEC
+AG((m1.stato = ricezione) -> AF(m1.stato = annuncio))
+
+-- Misbehavior 3: p, dopo aver invocato il metodo submitTender, non contatta s oppure produce una risposta corrotta.
+--                Il proxy viene incentivato ad eseguire correttamente il protocollo poichè riceverà il pagamento solo se il client riceve la risposta corretta.
+CTLSPEC
+AG((p.stato = verifica) -> AF(c.stato = paga))
+
+-- Misbehavior 4: m2 non consegna il payload a c.
+--                Il mule viene incentivato ad eseguire correttamente il protocollo poichè riceverà il pagamento solo se il client riceve la risposta corretta.
+CTLSPEC
+AG((m2.stato = decrittazione) -> AF(c.stato = paga))
+
+-- Starvation: c, dopo aver prodotto una richiesta, riceverà prima o poi una risposta.
+CTLSPEC
+AG((c.stato = richiesta) -> AF(c.stato = raccolta))
+
+-- Safety: m1 e m2 non possono essere contemporaneamente attivi rispetto al medesimo client.
+CTLSPEC
+AG(!(m1.payload[0] = messaggio & m2.payload[0] = messaggio))
+
+
+-- Modulo client: Il client si trova in una posizione di svantaggio, ovvero essere offline. Precedentemente al protocollo descritto in seguito, il client 
+--                necessita di una fase di setup in cui viene segnalato al sistema e ai mule attraverso una connessione online, tramite device sicuro. 
+--                Il client genera due set di chiavi segrete X e Y, le quali servono per decrittare payload e tender.
+--                Ipotizziamo che le richieste del client richiedano sempre una risposta dal server. 
+MODULE client(m1, m2)
+
+VAR
+  -- Variabile che rappresenta lo stato del client: spento, generazione di una richiesta, negoziazione con un mule, consegna di payload e tender,   
+  --                                                attesa della risposta, ricezione del tender, raccolta della risposta, controllo della risposta ricevuta e      --                                                rilascio o meno del pagamento al proxy.
+  stato : {spento, richiesta, negoziazione, consegna, attesa, ricezione, raccolta, controllo, paga, non_paga};
+  -- Array che rappresenta il payload, composto da: messaggio, geodata e chiave Y (direzione client-server),
+  --                                                risposta (direzione server-client).
+  payload : array 0..2 of {null, messaggio, risposta, geodata, key_y};
+  -- Array che rappresenta il tender, composto da: offerta per il proxy, chiave X e URI (direzione client-server),
+  --                                               geodata, chiave Y e URI (direzione server-client).
+  tender : array 0..2 of {null, offerta, key_x, geodata, key_y, URI};
+
+ASSIGN
+  -- Evoluzione dello stato: spento -> richiesta -> negoziazione -> consegna -> attesa -> ricezione -> raccolta -> controllo -> paga/non_paga -> spento 
+  init(stato) := spento;
+  next(stato) :=
+    case
+       (stato = spento) : richiesta;
+       (stato = richiesta) & (m1.posizione = vicino_client) : negoziazione;
+       (stato = negoziazione) : consegna;
+       (stato = consegna) : attesa;
+       (stato = attesa) & (m2.stato = negoziazione) : ricezione;
+       (stato = ricezione) : raccolta;
+       (stato = raccolta) : controllo;
+       (stato = controllo) & (soddisfatto = TRUE) : paga;
+       (stato = controllo) & (soddisfatto = FALSE) : non_paga;
+       (stato = paga) | (stato = non_paga) : spento;
+       TRUE : stato;
+    esac;
+
+  -- Inizialmente, il payload è vuoto.
+  init(payload[0]) := null;
+  init(payload[1]) := null;
+  init(payload[2]) := null;
+
+  -- Inizialmente, il tender è vuoto.
+  init(tender[0]) := null;
+  init(tender[1]) := null;
+  init(tender[2]) := null;
+
+  -- Simulazione dello scambio di informazioni.
+  -- Nella direzione client-server, una volta deciso il compenso per il mule, avviene la consegna di payload e tender.
+  -- Nella direzione server-client, il client riceve prima il tender e, dopo la negoziazione andata a buon fine, riceve il payload.
+  -- Nella posizione 0 del payload abbiamo il messaggio/la risposta.
+  next(payload[0]) := 
+    case
+       (stato = richiesta) : messaggio;
+       (stato = consegna) : null;
+       (stato = raccolta) : m2.payload[0];
+       (stato = paga) | (stato = non_paga) : null;
+       TRUE : payload[0];
+    esac;
+
+  -- Nella posizione 1 del payload abbiamo i geodata all'andata.
+  next(payload[1]) := 
+    case
+       (stato = richiesta) : geodata;
+       (stato = consegna) : null;
+       TRUE : payload[1];
+    esac;
+
+  -- Nella posizione 2 del payload abbiamo la chiave Y all'andata.
+  next(payload[2]) := 
+    case
+       (stato = richiesta) : key_y;
+       (stato = consegna) : null;
+       TRUE : payload[2];
+    esac;
+
+  -- Nella posizione 0 del tender abbiamo il compenso per il proxy all'andata e i geodata, estratti dal payload, al ritorno.
+  next(tender[0]) := 
+    case
+       (stato = richiesta) : offerta;
+       (stato = consegna) : null;
+       (stato = ricezione) : m2.tender[0];
+       (stato = paga) | (stato = non_paga) : null;
+       TRUE : tender[0];
+    esac;
+
+  -- Nella posizione 1 del tender abbiamo la chiave X all'andata e la chiave Y, estratta dal payload, al ritorno.
+  next(tender[1]) := 
+    case
+       (stato = richiesta) : key_x;
+       (stato = consegna) : null;
+       (stato = ricezione) : m2.tender[1];
+       (stato = paga) | (stato = non_paga) : null;
+       TRUE : tender[1];
+    esac;
+
+  -- Nella posizione 2 del tender abbiamo l'URI.
+  next(tender[2]) := 
+    case
+       (stato = richiesta) : URI;
+       (stato = consegna) : null;
+       (stato = ricezione) : m2.tender[2];
+       (stato = paga) | (stato = non_paga) : null;
+       TRUE : tender[2];
+    esac;
+
+DEFINE
+  -- Macro che simula ciò che il client si aspetta come risposta.
+  soddisfatto := ((payload[0] = risposta) & (payload[1] = null) & (payload[2] = null) 
+                  & (tender[0] = geodata) & (tender[1] = key_y) & (tender[2] = URI));
+
+
+-- Modulo mule: I mule fungono da tramite tra la zona offline (client) e la zona online (proxy) del protocollo.
+--              In questo sistema sono presenti due mule, uno che opera in direzione client-server (1) e l'altro in direzione server-client (2).
+MODULE mule(c, p, d, direzione)
+
+VAR
+  -- Variabile che simula la posizione del mule: esso può trovarsi vicino al client o vicino al proxy.
+  posizione : {vicino_client, vicino_proxy};
+  -- Variabile che rappresenta lo stato del mule: fermo, in movimento, ricezione di un payload, deposito del messaggio nel DFS, annuncio ai proxy nelle
+  --                                              vicinanze, raccolta della risposta dal proxy, decrittazione per trovare il luogo in cui si trova il client,      --                                              negoziazione del compenso e consegna della risposta.
+  stato : {fermo, spostamento, ricezione, deposito, annuncio, raccolta, decrittazione, negoziazione, consegna};
+  -- Array che rappresenta il payload, composto da: messaggio, geodata e chiave Y (direzione client-server),
+  --                                                risposta (direzione server-client).
+  payload : array 0..2 of {null, messaggio, risposta, geodata, key_y};
+  -- Array che rappresenta il tender, composto da: offerta per il proxy, chiave X e URI (direzione client-server),
+  --                                               geodata, chiave Y e URI (direzione server-client).
+  tender : array 0..2 of {null, offerta, key_x, geodata, key_y, URI};
+
+ASSIGN
+  -- Evoluzione della posizione dei mule. I due mule partono in posizioni diverse, a seconda della direzione in cui operano
+  init(posizione) :=
+    case 
+       (1 = direzione) : vicino_client;
+       (2 = direzione) : vicino_proxy;
+    esac;
+  next(posizione) :=
+    case
+       (posizione = vicino_client) & (stato = spostamento) : vicino_proxy;
+       (posizione = vicino_proxy) & (stato = spostamento) : vicino_client;
+       TRUE : posizione;
+    esac;
+
+  -- Evoluzione dello stato: Mule 1: fermo -> ricezione -> spostamento -> fermo -> deposito -> annuncio
+  --                         Mule 2: fermo -> raccolta -> decrittazione -> spostamento -> fermo -> negoziazione -> consegna
+  --                         Una volta completato il percorso, i mule tornano alla loro posizione originale.
+  init(stato) := fermo;
+  next(stato) :=
+    case
+       (stato = ricezione) | (stato = decrittazione) | (stato = annuncio) | (stato = consegna) : spostamento;
+       (stato = spostamento) : fermo;
+       (direzione = 1) & (c.stato = negoziazione) : ricezione;
+       (direzione = 1) & (posizione = vicino_proxy) & (p.stato = spento) : deposito;
+       (direzione = 1) & (stato = deposito) : annuncio;
+       (direzione = 2) & (p.stato = annuncio) : raccolta;
+       (direzione = 2) & (stato = raccolta) & (tender[1] = key_y) : decrittazione;
+       (direzione = 2) & (posizione = vicino_client) & (c.stato = attesa) : negoziazione;
+       (direzione = 2) & (c.stato = ricezione) : consegna;
+       TRUE : stato;
+    esac;
+
+  -- Inizialmente, il payload è vuoto.
+  init(payload[0]) := null;
+  init(payload[1]) := null;
+  init(payload[2]) := null;
+
+  -- Inizialmente, il tender è vuoto.
+  init(tender[0]) := null;
+  init(tender[1]) := null;
+  init(tender[2]) := null;
+
+  -- Simulazione dello scambio di informazioni.
+  -- Quando il mule annuncia al proxy che ha un messaggio, prima viene consegnato il tender, da cui viene ricavato l'URI per recuperare il payload.
+  -- Nella posizione 0 del payload abbiamo il messaggio/la risposta.
+  next(payload[0]) :=
+    case
+       (direzione = 1) & (stato = ricezione) : c.payload[0];
+       (direzione = 1) & (stato = deposito) : null;
+       (direzione = 2) & (stato = raccolta) : d.payload[0];
+       (direzione = 2) & (stato = consegna) : null;
+       TRUE : payload[0];
+    esac;
+
+  -- Nella posizione 1 del payload abbiamo i geodata all'andata.      
+  next(payload[1]) :=
+    case
+       (direzione = 1) & (stato = ricezione) : c.payload[1];
+       (direzione = 1) & (stato = deposito) : null;
+       (direzione = 2) & (stato = raccolta) : d.payload[1];
+       (direzione = 2) & (stato = consegna) : null;
+       TRUE : payload[1];
+   esac;
+
+  -- Nella posizione 2 del payload abbiamo la chiave Y all'andata.       
+  next(payload[2]) :=
+    case
+       (direzione = 1) & (stato = ricezione) : c.payload[2];
+       (direzione = 1) & (stato = deposito) : null;
+       (direzione = 2) & (stato = raccolta) : d.payload[2];
+       (direzione = 2) & (stato = consegna) : null;
+       TRUE : payload[2];
+    esac;
+
+  -- Nella posizione 0 del tender abbiamo i token per il proxy all'andata e i geodata, estratti dal payload, al ritorno.
+  next(tender[0]) :=
+    case
+       (direzione = 1) & (stato = ricezione) : c.tender[0];
+       (direzione = 1) & (stato = annuncio) : null;
+       (direzione = 2) & (p.stato = annuncio) : p.tender[0];
+       (direzione = 2) & (c.stato = ricezione) : null;
+       TRUE : tender[0];
+    esac;
+
+  -- Nella posizione 1 del tender abbiamo la chiave X all'andata e la chiave Y, estratta dal payload, al ritorno.       
+  next(tender[1]) :=
+    case
+       (direzione = 1) & (stato = ricezione) : c.tender[1];
+       (direzione = 1) & (stato = annuncio) : null;
+       (direzione = 2) & (p.stato = annuncio) : p.tender[1];
+       (direzione = 2) & (c.stato = ricezione) : null;
+       TRUE : tender[1];
+    esac;
+
+  -- Nella posizione 2 del tender abbiamo l'URI.       
+  next(tender[2]) :=
+    case
+       (direzione = 1) & (stato = ricezione) : c.tender[2];
+       (direzione = 1) & (stato = annuncio) : null;
+       (direzione = 2) & (p.stato = annuncio) : p.tender[2];
+       (direzione = 2) & (c.stato = ricezione) : null;
+       TRUE : tender[2];
+    esac;
+       
+-- Modulo DFS: I mule ed i proxy non scambiano direttamente il messaggio, ma depositano e prelevano i payload dal DFS, ovvero un sistema asincrono di
+--             immagazinamento dati. Ogni payload ha un URI unico associato che lo identifica.
+MODULE dfs(m1, m2, p)
+
+VAR
+  -- Array che rappresenta il payload, composto da: messaggio, geodata e chiave Y (direzione client-server),
+  --                                                risposta (direzione server-client).
+  payload : array 0..2 of {null, messaggio, risposta, geodata, key_y};
+
+ASSIGN
+
+  -- Inizialmente, il payload è vuoto.
+  init(payload[0]) := null;
+  init(payload[1]) := null;
+  init(payload[2]) := null;
+
+  -- Simulazione dello scambio d'informazioni.
+  -- Nella posizione 0 del payload abbiamo il messaggio/la risposta.
+  next(payload[0]) :=
+    case
+       (m1.stato = deposito) : m1.payload[0];
+       (p.stato = raccolta_dfs) : null;
+       (p.stato = annuncio) : p.payload[0];
+       (m2.stato = raccolta) : null;
+       TRUE : payload[0];
+    esac;
+
+  -- Nella posizione 1 del payload abbiamo i geodata.      
+  next(payload[1]) :=
+    case
+       (m1.stato = deposito) : m1.payload[1];
+       (p.stato = raccolta_dfs) : null;
+       (p.stato = annuncio) : p.payload[1];
+       (m2.stato = raccolta) : null;
+       TRUE : payload[1];
+   esac;
+
+  -- Nella posizione 2 del payload abbiamo la chiave Y.       
+  next(payload[2]) :=
+    case
+       (m1.stato = deposito) : m1.payload[2];
+       (p.stato = raccolta_dfs) : null;
+       (p.stato = annuncio) : p.payload[2];
+       (m2.stato = raccolta) : null;
+       TRUE : payload[2];
+    esac;
+
+       
+-- Modulo proxy: Il proxy ha lo scopo di tramite tra i mule ed il server, assumendo la funzione di punto online a cui i mule fanno riferimento.
+MODULE proxy(m1, m2, d, s)
+
+VAR
+  -- Variabile che rappresenta lo stato del proxy: spento, ricezione di un messaggio da un mule, raccolta del payload dal DFS, verifica tramite il metodo 
+  --                                               submitTender, decrittazione del messaggio tramite la chiave X, consegna del messaggio al server, attesa di 
+  --                                               una risposta, raccolta della risposta dal server ed annuncio ai mule nelle vicinanze.
+  stato : {spento, ricezione, raccolta_dfs, verifica, decrittazione, consegna, attesa, raccolta_s, annuncio};
+  -- Array che rappresenta il payload, composto da: messaggio, geodata e chiave Y (direzione client-server),
+  --                                                risposta (direzione server-client).
+  payload : array 0..2 of {null, messaggio, risposta, geodata, key_y};  
+  -- Array che rappresenta il tender, composto da: offerta per il proxy, chiave X e URI (direzione client-server),
+  --                                               geodata, chiave Y e URI (direzione server-client).
+  tender : array 0..2 of {null, offerta, key_x, geodata, key_y, URI};
+
+ASSIGN
+  -- Evoluzione dello stato: spento -> ricezione -> raccolta_dfs -> verifica -> decrittazione -> consegna -> attesa -> raccolta_s -> annuncio -> spento
+  init(stato) := spento;
+  next(stato) :=
+    case
+       (stato = spento) & (m1.posizione = vicino_proxy) : ricezione;
+       (stato = ricezione) & (tender[2] = URI) : raccolta_dfs;
+       (stato = raccolta_dfs) & (tender[0] = offerta) : verifica;
+       (stato = verifica) & (tender[1] = key_x) : decrittazione;
+       (stato = decrittazione) : consegna;
+       (stato = consegna) : attesa;
+       (stato = attesa) & (s.stato = consegna) : raccolta_s;
+       (stato = raccolta_s) & (m2.posizione = vicino_proxy) : annuncio;
+       (stato = annuncio) : spento;
+       TRUE : stato;
+    esac;
+
+  -- Inizialmente, il payload è vuoto.
+  init(payload[0]) := null;
+  init(payload[1]) := null;
+  init(payload[2]) := null;
+
+  -- Inizialmente, il tender è vuoto.
+  init(tender[0]) := null;
+  init(tender[1]) := null;
+  init(tender[2]) := null;
+
+  -- Simulazione dello scambio di informazioni.
+  -- Il proxy necessita dell'URI per estrarre il payload dal DFS.
+  -- Nella posizione 0 del payload abbiamo il messaggio/la risposta.
+  next(payload[0]) :=
+    case
+       (stato = raccolta_dfs) : d.payload[0];
+       (stato = consegna) : null;
+       (stato = raccolta_s) : risposta;
+       (stato = annuncio) : null;
+       TRUE : payload[0];
+    esac;
+       
+  -- Nella posizione 1 del payload abbiamo i geodata all'andata.
+  next(payload[1]) :=
+    case
+       (stato = raccolta_dfs) : d.payload[1];
+       (stato = consegna) : null;
+       TRUE : payload[1];
+    esac;
+  
+  -- Nella posizione 2 del payload abbiamo la chiave Y all'andata.  
+  next(payload[2]) :=
+    case
+       (stato = raccolta_dfs) : d.payload[2];
+       (stato = consegna) : null;
+       TRUE : payload[2];
+    esac;
+
+  -- Nella posizione 0 del tender abbiamo i token per il proxy all'andata e i geodata estratti dal payload al ritorno.
+  next(tender[0]) :=
+    case
+       (m1.stato = annuncio) : m1.tender[0];
+       (stato = consegna) & (payload[1] = geodata) : geodata;
+       (stato = annuncio) : null;
+       TRUE : tender[0];
+    esac;
+       
+  -- Nella posizione 1 del tender abbiamo la chiave X all'andata e la chiave Y estratta dal payload al ritorno.
+  next(tender[1]) :=
+    case
+       (m1.stato = annuncio) : m1.tender[1];
+       (stato = consegna) & (payload[2] = key_y) : key_y;
+       (stato = annuncio) : null;
+       TRUE : tender[1];
+    esac;
+
+  -- Nella posizione 2 del tender abbiamo l'URI.
+  next(tender[2]) :=
+    case
+       (m1.stato = annuncio) : m1.tender[2];
+       (stato = annuncio) : null;
+       TRUE : tender[2];
+    esac;
+
+
+-- Modulo server: Il server comunica esclusivamente con il proxy ed è all'oscuro dell'implementazione del protocollo.
+MODULE server(p)
+
+VAR
+  -- Variabile che rappresenta lo stato del server: spento, elaborazione di una risposta e consegna della risposta al proxy.
+  stato : {spento, elaborazione, consegna};
+
+ASSIGN
+  -- Evoluzione dello stato: spento -> elaborazione -> consegna -> spento
+  init(stato) := spento;
+  next(stato) :=
+    case
+       (stato = spento) & (p.stato = consegna) & (p.payload[0] = messaggio) : elaborazione;
+       (stato = elaborazione) : consegna;
+       (stato = consegna) & (p.stato = raccolta_s) : spento;
+       TRUE : stato;
+    esac;
+
+
+-- NuSMV > check_fsm
+-- ##########################################################
+-- The transition relation is total: No deadlock state exists
+-- ##########################################################
+
+-- NuSMV > print_reachable_states
+-- ######################################################################
+-- system diameter: 26
+-- reachable states: 26 (2^4.70044) out of 5.81131e+024 (2^82.2651)
+-- ######################################################################
